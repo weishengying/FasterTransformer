@@ -170,12 +170,15 @@ __launch_bounds__(TPB) __global__ void moe_top_k(const T*    inputs_after_softma
   2) This implementation assumes k is small, but will work for any k.
 */
 
+// CTA stands for Cooperative Thread Array (which is essentially a thread block).
+// finished usually is nullptr
+// LDG: "load globally"
 template<typename T, int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG>
 __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topk_gating_softmax(
     const T* input, const bool* finished, T* output, const int num_rows, int* indices, int* source_rows, const int k)
 {
     // We begin by enforcing compile time assertions and setting up compile time constants.
-    static_assert(VPT == (VPT & -VPT), "VPT must be power of 2");
+    static_assert(VPT == (VPT & -VPT), "VPT must be power of 2"); // a single thread should handle VPT elements of a row
     static_assert(NUM_EXPERTS == (NUM_EXPERTS & -NUM_EXPERTS), "NUM_EXPERTS must be power of 2");
     static_assert(BYTES_PER_LDG == (BYTES_PER_LDG & -BYTES_PER_LDG), "BYTES_PER_LDG must be power of 2");
     static_assert(BYTES_PER_LDG <= 16, "BYTES_PER_LDG must be leq 16");
@@ -183,7 +186,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topk_gating_softmax(
     // Number of bytes each thread pulls in per load
     static constexpr int ELTS_PER_LDG    = BYTES_PER_LDG / sizeof(T);
     static constexpr int ELTS_PER_ROW    = NUM_EXPERTS;
-    static constexpr int THREADS_PER_ROW = ELTS_PER_ROW / VPT;
+    static constexpr int THREADS_PER_ROW = ELTS_PER_ROW / VPT; //a row of input need THREADS_PER_ROW threads tp handle
     static constexpr int LDG_PER_THREAD  = VPT / ELTS_PER_LDG;
 
     // Restrictions based on previous section.
@@ -212,7 +215,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topk_gating_softmax(
     // The threads in a warp are split into sub-groups that will work on a row.
     // We compute row offset for each thread sub-group
     const int thread_row_in_warp = threadIdx.x / THREADS_PER_ROW;
-    const int thread_row         = warp_base_row + thread_row_in_warp;
+    const int thread_row         = warp_base_row + thread_row_in_warp; //now we get the row on which thread will work
 
     // Threads with indices out of bounds should early exit here.
     if (thread_row >= num_rows)
@@ -230,7 +233,7 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topk_gating_softmax(
 
     // Determine the pointer type to use to read in the data depending on the BYTES_PER_LDG template param. In theory,
     // this can support all powers of 2 up to 16.
-    using AccessType = cutlass::AlignedArray<T, ELTS_PER_LDG>;
+    using AccessType = cutlass::AlignedArray<T, ELTS_PER_LDG>; // AccessType is a set of ELTS_PER_LDG number elements of an row which a single thread can load in one memory transaction
 
     // Finally, we pull in the data from global mem
     cutlass::Array<T, VPT> row_chunk_input;
@@ -238,26 +241,26 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topk_gating_softmax(
     const AccessType*      vec_thread_read_ptr = reinterpret_cast<const AccessType*>(thread_read_ptr);
 #pragma unroll
     for (int ii = 0; ii < LDG_PER_THREAD; ++ii) {
-        row_chunk_vec_ptr[ii] = vec_thread_read_ptr[ii * THREADS_PER_ROW];
+        row_chunk_vec_ptr[ii] = vec_thread_read_ptr[ii * THREADS_PER_ROW]; //load input data from global memory to aligned vector row_chunk_input
     }
 
     using ComputeType = float;
     using Converter   = cutlass::NumericArrayConverter<ComputeType, T, VPT>;
     Converter                        compute_type_converter;
-    cutlass::Array<ComputeType, VPT> row_chunk = compute_type_converter(row_chunk_input);
+    cutlass::Array<ComputeType, VPT> row_chunk = compute_type_converter(row_chunk_input);// convert T type of input data to ComputeTye
 
     // First, we perform a max reduce within the thread. We can do the max in fp16 safely (I think) and just
     // convert to float afterwards for the exp + sum reduction.
     ComputeType thread_max = row_chunk[0];
 #pragma unroll
     for (int ii = 1; ii < VPT; ++ii) {
-        thread_max = max(thread_max, row_chunk[ii]);
+        thread_max = max(thread_max, row_chunk[ii]); // we got the max value of elements which a single thread reponsible for
     }
 
 // Now, we find the max within the thread group and distribute among the threads. We use a butterfly reduce.
 #pragma unroll
     for (int mask = THREADS_PER_ROW / 2; mask > 0; mask /= 2) {
-        thread_max = max(thread_max, __shfl_xor_sync(0xFFFFFFFF, thread_max, mask, THREADS_PER_ROW));
+        thread_max = max(thread_max, __shfl_xor_sync(0xFFFFFFFF, thread_max, mask, THREADS_PER_ROW));// we got the max value of an row in every thread which responsible for same row
     }
 
     // From this point, thread max in all the threads have the max within the row.
@@ -290,10 +293,10 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topk_gating_softmax(
     // Now, softmax_res contains the softmax of the row chunk. Now, I want to find the topk elements in each row, along
     // with the max index.​
     int                  start_col          = first_elt_read_by_thread;
-    static constexpr int COLS_PER_GROUP_LDG = ELTS_PER_LDG * THREADS_PER_ROW;
+    static constexpr int COLS_PER_GROUP_LDG = ELTS_PER_LDG * THREADS_PER_ROW; //a group work on an row, and will load COLS_PER_GROUP_LDG elements from global memory
 
     for (int k_idx = 0; k_idx < k; ++k_idx) {
-        // First, each thread does the local argmax
+        // First, each thread does the local argmax（each single thread work on a chunk of an row, and a thread group work on an entire raw）
         float max_val = row_chunk[0];
         int   expert  = start_col;
 #pragma unroll
@@ -353,18 +356,21 @@ __launch_bounds__(WARPS_PER_CTA* WARP_SIZE) __global__ void topk_gating_softmax(
 
 namespace detail {
 // Constructs some constants needed to partition the work across threads at compile time.
-template<typename T, int EXPERTS, int BYTES_PER_LDG>
+template<typename T, int EXPERTS, int BYTES_PER_LDG> // T refers to input data type
 struct TopkConstants {
-    static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T);
+    static constexpr int ELTS_PER_LDG = BYTES_PER_LDG / sizeof(T); //refers to the number of elements loaded by a single memory load operation, if BYTES_PER_LDG = 16, input data type = half, then ELTS_PER_LDG = 8
     static_assert(EXPERTS / (ELTS_PER_LDG * WARP_SIZE) == 0 || EXPERTS % (ELTS_PER_LDG * WARP_SIZE) == 0, "");
-    static constexpr int VECs_PER_THREAD = std::max(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE));
-    static constexpr int VPT             = VECs_PER_THREAD * ELTS_PER_LDG;
-    static constexpr int THREADS_PER_ROW = EXPERTS / VPT;
-    static constexpr int ROWS_PER_WARP   = WARP_SIZE / THREADS_PER_ROW;
+
+    // Here, for every row, there are EXPERTS elements, and ELTS_PER_LDG of elements make up a vector, so the total vecs number is  EXPERTS / ELTS_PER_LDG
+    // The orginal algo design is "all threads in a warp responsible for a row", but if we found the EXPERTS of a row is not enough, a warp will responsible more rows and a thread in a warp will handle only one vec
+    static constexpr int VECs_PER_THREAD = std::max(1, EXPERTS / (ELTS_PER_LDG * WARP_SIZE)); // refers to the number of vector processed per thread in a CUDA kernel.
+    static constexpr int VPT             = VECs_PER_THREAD * ELTS_PER_LDG; // This gives the total number of elements (or vectors, depending on how you interpret it) processed by a single thread.
+    static constexpr int THREADS_PER_ROW = EXPERTS / VPT; // a row will need THREADS_PER_ROW threads to handle
+    static constexpr int ROWS_PER_WARP   = WARP_SIZE / THREADS_PER_ROW; // a warp can handle ROWS_PER_WARP rows
 };
 }  // namespace detail
 
-template<typename T, int EXPERTS, int WARPS_PER_TB>
+template<typename T, int EXPERTS, int WARPS_PER_TB> //T is the input datatype
 void topk_gating_softmax_launcher_helper(const T*     input,
                                          const bool*  finished,
                                          T*           output,
@@ -378,14 +384,15 @@ void topk_gating_softmax_launcher_helper(const T*     input,
     FT_LOG_DEBUG(__PRETTY_FUNCTION__);
     static constexpr unsigned long MAX_BYTES_PER_LDG = 16;
 
+    // BYTES_PER_LDG typically refers to the number of bytes loaded by a single memory load operation
     static constexpr int BYTES_PER_LDG = std::min(MAX_BYTES_PER_LDG, sizeof(T) * EXPERTS);
     using Constants                    = detail::TopkConstants<T, EXPERTS, BYTES_PER_LDG>;
-    static constexpr int VPT           = Constants::VPT;
-    static constexpr int ROWS_PER_WARP = Constants::ROWS_PER_WARP;
-    const int            num_warps     = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP;
-    const int            num_blocks    = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;
+    static constexpr int VPT           = Constants::VPT; // This gives the total number of elements (or vectors, depending on how you interpret it) processed by a single thread.
+    static constexpr int ROWS_PER_WARP = Constants::ROWS_PER_WARP; //a warp reponse for ROWS_PER_WARP rows of input
+    const int            num_warps     = (num_rows + ROWS_PER_WARP - 1) / ROWS_PER_WARP; 
+    const int            num_blocks    = (num_warps + WARPS_PER_TB - 1) / WARPS_PER_TB;// WARPS_PER_TB is staticly set to 4
 
-    dim3 block_dim(WARP_SIZE, WARPS_PER_TB);
+    dim3 block_dim(WARP_SIZE, WARPS_PER_TB); // (32, 4)
     topk_gating_softmax<T, VPT, EXPERTS, WARPS_PER_TB, BYTES_PER_LDG>
         <<<num_blocks, block_dim, 0, stream>>>(input, finished, output, num_rows, indices, source_row, k);
 }
@@ -403,7 +410,7 @@ void topk_gating_softmax_kernelLauncher(const T*     input,
                                         cudaStream_t stream)
 {
     FT_LOG_DEBUG(__PRETTY_FUNCTION__);
-    static constexpr int WARPS_PER_TB = 4;
+    static constexpr int WARPS_PER_TB = 4; //a warp consists of 32 threads, if a thread block consists of 4 warps, it contains 128 threads.
 
     switch (num_experts) {
         case 2: {
